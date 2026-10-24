@@ -214,7 +214,7 @@ impl Completion {
                     doc.append_changes_to_history(view);
 
                     // item always present here
-                    let (transaction, additional_edits, snippet) = match item.clone() {
+                    let (transaction, additional_edits, snippet, command) = match item.clone() {
                         CompletionItem::Lsp(mut item) => {
                             let language_server = language_server!(item);
 
@@ -243,10 +243,11 @@ impl Completion {
                                 transaction,
                                 add_edits.map(|edits| (edits, encoding)),
                                 snippet,
+                                item.item.command.map(|command| (item.provider, command)),
                             )
                         }
                         CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
-                            (transaction, None, None)
+                            (transaction, None, None, None)
                         }
                     };
 
@@ -275,6 +276,11 @@ impl Completion {
                             );
                             doc.apply(&transaction, view.id);
                         }
+                    }
+                    // Completion commands run only on acceptance, after all edits have
+                    // been applied and sent to the originating language server.
+                    if let Some((server_id, command)) = command {
+                        editor.execute_lsp_command(command, server_id);
                     }
                     // we could have just inserted a trigger char (like a `crate::` completion for rust
                     // so we want to retrigger immediately when accepting a completion.

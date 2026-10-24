@@ -1,5 +1,86 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_command_runs_on_accept_not_preview_or_cancel() -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // Resolve supplies a command that inserts text through a workspace edit.
+    let mut server = tempfile::NamedTempFile::new()?;
+    let file = tempfile::Builder::new().suffix(".rs").tempfile()?;
+    std::fs::write(file.path(), "sub\n")?;
+    let uri = helix_lsp::lsp::Url::from_file_path(file.path()).unwrap();
+    let script = r#"
+reply() {
+    message="{\"jsonrpc\":\"2.0\",\"id\":$1,\"result\":$2}"
+    printf 'Content-Length: %s\r\n\r\n%s' "${#message}" "$message"
+}
+count=0
+while IFS= read -r header; do
+    length=$(printf '%s' "${header#Content-Length: }" | tr -d '\r')
+    IFS= read -r blank
+    body=$(dd bs=1 count="$length" 2>/dev/null)
+    id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$body" in
+        *'"method":"initialize"'*)
+            reply "$id" '{"capabilities":{"textDocumentSync":1,"completionProvider":{"resolveProvider":true},"executeCommandProvider":{"commands":["complete"]}}}' ;;
+        *'"method":"textDocument/completion"'*)
+            reply "$id" '[{"label":"submarine","textEdit":{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":3}},"newText":""}}]' ;;
+        *'"method":"completionItem/resolve"'*)
+            reply "$id" '{"label":"submarine","textEdit":{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":3}},"newText":""},"command":{"title":"Complete","command":"complete"}}' ;;
+        *'"method":"workspace/executeCommand"'*)
+            count=$((count + 1))
+            message='{"jsonrpc":"2.0","id":"edit","method":"workspace/applyEdit","params":{"edit":{"changes":{"$DOCUMENT_URI":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"completed-'"$count"'"}]}}}}'
+            printf 'Content-Length: %s\r\n\r\n%s' "${#message}" "$message"
+            reply "$id" null ;;
+        *'"method":"shutdown"'*) reply "$id" null ;;
+        *'"method":"exit"'*) exit 0 ;;
+    esac
+done
+"#;
+    server.write_all(script.replace("$DOCUMENT_URI", uri.as_str()).as_bytes())?;
+    server.flush()?;
+
+    let loader = test_syntax_loader(Some(format!(
+        r#"
+        [language-server.completion-test]
+        command = "sh"
+        args = [{:?}]
+        [[language]]
+        name = "rust"
+        language-servers = ["completion-test"]
+        "#,
+        server.path().to_str().unwrap()
+    )));
+    let mut config = test_config();
+    config.editor.lsp.enable = true;
+    config.editor.auto_completion = false;
+    let mut app = AppBuilder::new()
+        .with_config(config)
+        .with_lang_loader(loader)
+        .with_file(file.path(), None)
+        .build()?;
+    run_event_loop_until_idle(&mut app).await;
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (Some("A<C-x>"), None),
+            (
+                Some("<C-n><C-c>"),
+                Some(&|app| assert_eq!(helix_view::doc!(app.editor).text(), "sub\n")),
+            ),
+            (Some("<C-x>"), None),
+            (
+                Some("<C-n><ret>"),
+                Some(&|app| assert_eq!(helix_view::doc!(app.editor).text(), "completed-1\n")),
+            ),
+        ],
+        false,
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn change_line_above_comment() -> anyhow::Result<()> {
     // <https://github.com/helix-editor/helix/issues/12570>
