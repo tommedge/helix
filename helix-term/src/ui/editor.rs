@@ -24,14 +24,14 @@ use helix_core::{
 };
 use helix_view::{
     annotations::diagnostics::DiagnosticFilter,
-    document::{Mode, SCRATCH_BUFFER_NAME},
+    document::Mode,
     editor::{CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
     Document, Editor, Theme, View,
 };
-use std::{mem::take, num::NonZeroUsize, ops, path::PathBuf, rc::Rc};
+use std::{mem::take, num::NonZeroUsize, ops, rc::Rc};
 
 use tui::{buffer::Buffer as Surface, text::Span};
 
@@ -661,7 +661,6 @@ impl EditorView {
 
     /// Render bufferline at the top
     pub fn render_bufferline(editor: &Editor, viewport: Rect, surface: &mut Surface) {
-        let scratch = PathBuf::from(SCRATCH_BUFFER_NAME); // default filename to use for scratch buffer
         surface.clear_with(
             viewport,
             editor
@@ -684,9 +683,10 @@ impl EditorView {
         let current_doc = view!(editor).doc;
 
         for doc in editor.documents() {
+            let name = doc.display_name();
             let fname = doc
                 .path()
-                .unwrap_or(&scratch)
+                .unwrap_or_else(|| std::path::Path::new(name.as_ref()))
                 .file_name()
                 .unwrap_or_default()
                 .to_str()

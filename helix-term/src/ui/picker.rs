@@ -314,12 +314,18 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .filter(|col: &&Column<T, D>| col.filter)
             .count() as u32;
         assert!(matcher_columns > 0);
-        let matcher = Nucleo::new(
-            Config::DEFAULT,
-            Arc::new(helix_event::request_redraw),
-            None,
-            matcher_columns,
-        );
+        #[cfg(feature = "integration")]
+        let redraw = {
+            // The test event system is runtime-local, but nucleo uses Rayon workers.
+            let runtime = tokio::runtime::Handle::current();
+            move || {
+                let _guard = runtime.enter();
+                helix_event::request_redraw();
+            }
+        };
+        #[cfg(not(feature = "integration"))]
+        let redraw = helix_event::request_redraw;
+        let matcher = Nucleo::new(Config::DEFAULT, Arc::new(redraw), None, matcher_columns);
         let injector = matcher.injector();
         for item in options {
             inject_nucleo_item(&injector, &columns, item, &editor_data);

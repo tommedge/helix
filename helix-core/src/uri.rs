@@ -4,15 +4,14 @@ use std::{
     sync::Arc,
 };
 
-/// A generic pointer to a file location.
-///
-/// Currently this type only supports paths to local files.
+/// A pointer to a local file or a language-server-owned archive source.
 ///
 /// Cloning this type is cheap: the internal representation uses an Arc.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Uri {
     File(Arc<Path>),
+    Archive(Arc<helix_stdx::Url>),
 }
 
 impl Uri {
@@ -21,12 +20,14 @@ impl Uri {
     pub fn to_url(&self) -> Result<helix_stdx::Url, ()> {
         match self {
             Uri::File(path) => helix_stdx::Url::from_file_path(path),
+            Uri::Archive(url) => Ok((**url).clone()),
         }
     }
 
     pub fn as_path(&self) -> Option<&Path> {
         match self {
             Self::File(path) => Some(path),
+            Self::Archive(_) => None,
         }
     }
 }
@@ -47,6 +48,7 @@ impl fmt::Display for Uri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::File(path) => write!(f, "{}", path.display()),
+            Self::Archive(url) => write!(f, "{url}"),
         }
     }
 }
@@ -88,6 +90,8 @@ fn convert_url_to_uri(url: &helix_stdx::Url) -> Result<Uri, UrlConversionErrorKi
         url.to_file_path()
             .map(|path| Uri::File(helix_stdx::path::normalize(path).into()))
             .map_err(|_| UrlConversionErrorKind::UnableToConvert)
+    } else if matches!(url.scheme(), "jar" | "jrt") {
+        Ok(Uri::Archive(Arc::new(url.clone())))
     } else {
         Err(UrlConversionErrorKind::UnsupportedScheme)
     }
@@ -116,6 +120,20 @@ impl TryFrom<&helix_stdx::Url> for Uri {
 mod test {
     use super::*;
     use helix_stdx::Url;
+
+    #[test]
+    fn archive_identity_is_not_a_filesystem_path() {
+        for source in [
+            "jar:file:///project%20one/library.jar!/example/Outer$Inner.java",
+            "jrt:/java.base/java/lang/String.java",
+        ] {
+            let url = Url::parse(source).unwrap();
+            let uri = Uri::try_from(&url).unwrap();
+            assert!(uri.as_path().is_none());
+            assert_eq!(uri.to_url().unwrap(), url);
+            assert_eq!(uri.to_string(), source);
+        }
+    }
 
     #[test]
     fn unknown_scheme() {

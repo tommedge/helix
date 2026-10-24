@@ -17,11 +17,7 @@ use helix_stdx::{
     path,
     rope::{self, RopeSliceExt},
 };
-use helix_view::{
-    align_view,
-    document::{from_reader, SCRATCH_BUFFER_NAME},
-    Align, Document, DocumentId, Editor,
-};
+use helix_view::{align_view, document::from_reader, Align, Document, DocumentId, Editor};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 use crate::{
@@ -89,13 +85,13 @@ impl TagKind {
 #[derive(Debug, Clone)]
 enum UriOrDocumentId {
     Uri(Uri),
-    Id(DocumentId),
+    Id(DocumentId, String),
 }
 
 impl UriOrDocumentId {
     fn path_or_id(&self) -> Option<PathOrId<'_>> {
         match self {
-            Self::Id(id) => Some(PathOrId::Id(*id)),
+            Self::Id(id, _) => Some(PathOrId::Id(*id)),
             Self::Uri(uri) => uri.as_path().map(PathOrId::Path),
         }
     }
@@ -189,7 +185,13 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
     let doc_id = doc.id();
     let text = doc.text().slice(..);
     let loader = cx.editor.syn_loader.load();
-    let tags = tags_iter(syntax, &loader, text, UriOrDocumentId::Id(doc.id()), None);
+    let tags = tags_iter(
+        syntax,
+        &loader,
+        text,
+        UriOrDocumentId::Id(doc.id(), doc.display_name().into_owned()),
+        None,
+    );
 
     let columns = vec![
         PickerColumn::new("kind", |tag: &Tag, _| tag.kind.as_str().into()),
@@ -280,23 +282,20 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
     let columns = vec![
         PickerColumn::new("kind", |tag: &Tag, _| tag.kind.as_str().into()),
         PickerColumn::new("name", |tag: &Tag, _| tag.name.as_str().into()).without_filtering(),
-        PickerColumn::new("path", |tag: &Tag, state: &SearchState| {
-            match &tag.doc {
-                UriOrDocumentId::Uri(uri) => {
-                    if let Some(path) = uri.as_path() {
-                        let path = if let Ok(stripped) = path.strip_prefix(&state.search_root) {
-                            stripped
-                        } else {
-                            path
-                        };
-                        path.to_string_lossy().into()
+        PickerColumn::new("path", |tag: &Tag, state: &SearchState| match &tag.doc {
+            UriOrDocumentId::Uri(uri) => {
+                if let Some(path) = uri.as_path() {
+                    let path = if let Ok(stripped) = path.strip_prefix(&state.search_root) {
+                        stripped
                     } else {
-                        uri.to_string().into()
-                    }
+                        path
+                    };
+                    path.to_string_lossy().into()
+                } else {
+                    uri.to_string().into()
                 }
-                // This picker only uses `Id` for scratch buffers for better display.
-                UriOrDocumentId::Id(_) => SCRATCH_BUFFER_NAME.into(),
             }
+            UriOrDocumentId::Id(_, name) => name.as_str().into(),
         }),
     ];
 
@@ -317,9 +316,9 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
             let Some(syntax) = doc.syntax() else { continue };
             let text = doc.text().slice(..);
             let uri_or_id = doc
-                .uri()
-                .map(UriOrDocumentId::Uri)
-                .unwrap_or_else(|| UriOrDocumentId::Id(doc.id()));
+                .path()
+                .map(|path| UriOrDocumentId::Uri(path.into()))
+                .unwrap_or_else(|| UriOrDocumentId::Id(doc.id(), doc.display_name().into_owned()));
             for tag in tags_iter(syntax, &loader, text.slice(..), uri_or_id, Some(&pattern)) {
                 if injector.push(tag).is_err() {
                     return async { Ok(()) }.boxed();
@@ -430,7 +429,10 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         state,
         move |cx, tag, action| {
             let doc_id = match &tag.doc {
-                UriOrDocumentId::Id(id) => *id,
+                UriOrDocumentId::Id(id, _) => {
+                    cx.editor.switch(*id, action);
+                    *id
+                },
                 UriOrDocumentId::Uri(uri) => match cx.editor.open(uri.as_path().expect(""), action) {
                     Ok(id) => id,
                     Err(e) => {

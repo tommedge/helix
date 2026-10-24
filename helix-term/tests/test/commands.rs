@@ -3,6 +3,8 @@ use helix_term::application::Application;
 use super::*;
 
 mod insert;
+#[cfg(unix)]
+mod lsp;
 mod movement;
 mod reverse_selection_contents;
 mod rotate_selection_contents;

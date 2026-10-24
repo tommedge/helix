@@ -37,7 +37,6 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::Display,
     future::Future,
-    path::Path,
 };
 
 /// Gets the first language server that is attached to a document which supports a specific feature.
@@ -69,11 +68,13 @@ struct Location {
     uri: Uri,
     range: lsp::Range,
     offset_encoding: OffsetEncoding,
+    server_id: LanguageServerId,
 }
 
 fn lsp_location_to_location(
     location: lsp::Location,
     offset_encoding: OffsetEncoding,
+    server_id: LanguageServerId,
 ) -> Option<Location> {
     let uri = match location.uri.try_into() {
         Ok(uri) => uri,
@@ -86,6 +87,7 @@ fn lsp_location_to_location(
         uri,
         range: location.range,
         offset_encoding,
+        server_id,
     })
 }
 
@@ -119,35 +121,44 @@ fn jump_to_location(editor: &mut Editor, location: &Location, action: Action) {
     let (view, doc) = current!(editor);
     push_jump(view, doc);
 
-    let Some(path) = location.uri.as_path() else {
-        let err = format!("unable to convert URI to filepath: {:?}", location.uri);
-        editor.set_error(err);
+    if location.uri.as_path().is_none() {
+        let content = editor.virtual_document_content(&location.uri, location.server_id);
+        let location = location.clone();
+        tokio::spawn(async move {
+            let content = content.await;
+            crate::job::dispatch(move |editor, _| {
+                let result = content.and_then(|content| {
+                    editor.open_lsp_document(&location.uri, location.server_id, content, action)
+                });
+                match result {
+                    Ok(id) => select_lsp_range(
+                        editor,
+                        id,
+                        location.range,
+                        location.offset_encoding,
+                        action,
+                    ),
+                    Err(err) => editor.set_error(format!("Failed to open {}: {err}", location.uri)),
+                }
+            })
+            .await;
+        });
         return;
-    };
-    jump_to_position(
-        editor,
-        path,
-        location.range,
-        location.offset_encoding,
-        action,
-    );
+    }
+    match editor.open(location.uri.as_path().unwrap(), action) {
+        Ok(id) => select_lsp_range(editor, id, location.range, location.offset_encoding, action),
+        Err(err) => editor.set_error(format!("Failed to open {}: {err}", location.uri)),
+    }
 }
 
-fn jump_to_position(
+pub(crate) fn select_lsp_range(
     editor: &mut Editor,
-    path: &Path,
+    doc_id: DocumentId,
     range: lsp::Range,
     offset_encoding: OffsetEncoding,
     action: Action,
 ) {
-    let doc = match editor.open(path, action) {
-        Ok(id) => doc_mut!(editor, &id),
-        Err(err) => {
-            let err = format!("failed to open path: {:?}: {:?}", path, err);
-            editor.set_error(err);
-            return;
-        }
-    };
+    let doc = doc_mut!(editor, &doc_id);
     let view = view_mut!(editor);
     // TODO: convert inside server
     let new_range = if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding)
@@ -230,6 +241,7 @@ fn diag_picker(
                         uri: uri.clone(),
                         range: diag.range,
                         offset_encoding: ls.offset_encoding(),
+                        server_id: ls.id(),
                     },
                     diag,
                 });
@@ -322,6 +334,7 @@ pub fn symbol_picker(cx: &mut Context) {
         uri: &Uri,
         symbol: lsp::DocumentSymbol,
         offset_encoding: OffsetEncoding,
+        server_id: LanguageServerId,
     ) {
         #[allow(deprecated)]
         list.push(SymbolInformationItem {
@@ -337,10 +350,11 @@ pub fn symbol_picker(cx: &mut Context) {
                 uri: uri.clone(),
                 range: symbol.selection_range,
                 offset_encoding,
+                server_id,
             },
         });
         for child in symbol.children.into_iter().flatten() {
-            nested_to_flat(list, file, uri, child, offset_encoding);
+            nested_to_flat(list, file, uri, child, offset_encoding, server_id);
         }
     }
     let doc = doc!(cx.editor);
@@ -353,6 +367,7 @@ pub fn symbol_picker(cx: &mut Context) {
         .map(|language_server| {
             let request = language_server.document_symbols(doc.identifier()).unwrap();
             let offset_encoding = language_server.offset_encoding();
+            let server_id = language_server.id();
             let doc_id = doc.identifier();
             let doc_uri = doc
                 .uri()
@@ -373,6 +388,7 @@ pub fn symbol_picker(cx: &mut Context) {
                                 uri: doc_uri.clone(),
                                 range: symbol.location.range,
                                 offset_encoding,
+                                server_id,
                             },
                             symbol,
                         })
@@ -386,6 +402,7 @@ pub fn symbol_picker(cx: &mut Context) {
                                 &doc_uri,
                                 symbol,
                                 offset_encoding,
+                                server_id,
                             )
                         }
                         flat_symbols
@@ -474,6 +491,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                     .workspace_symbols(pattern.to_string())
                     .unwrap();
                 let offset_encoding = language_server.offset_encoding();
+                let server_id = language_server.id();
                 async move {
                     let symbols = request
                         .await?
@@ -498,6 +516,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
                                     uri,
                                     range: symbol.location.range,
                                     offset_encoding,
+                                    server_id,
                                 },
                                 symbol,
                             })
@@ -955,7 +974,8 @@ where
             let offset_encoding = language_server.offset_encoding();
             let pos = doc.position(view.id, offset_encoding);
             let future = request_provider(language_server, pos, doc.identifier()).unwrap();
-            async move { anyhow::Ok((future.await?, offset_encoding)) }
+            let server_id = language_server.id();
+            async move { anyhow::Ok((future.await?, offset_encoding, server_id)) }
         })
         .collect();
 
@@ -963,13 +983,17 @@ where
         let mut locations = Vec::new();
         while let Some(response) = futures.next().await {
             match response {
-                Ok((response, offset_encoding)) => match response {
+                Ok((response, offset_encoding, server_id)) => match response {
                     Some(lsp::GotoDefinitionResponse::Scalar(lsp_location)) => {
-                        locations.extend(lsp_location_to_location(lsp_location, offset_encoding));
+                        locations.extend(lsp_location_to_location(
+                            lsp_location,
+                            offset_encoding,
+                            server_id,
+                        ));
                     }
                     Some(lsp::GotoDefinitionResponse::Array(lsp_locations)) => {
                         locations.extend(lsp_locations.into_iter().flat_map(|location| {
-                            lsp_location_to_location(location, offset_encoding)
+                            lsp_location_to_location(location, offset_encoding, server_id)
                         }));
                     }
                     Some(lsp::GotoDefinitionResponse::Link(lsp_locations)) => {
@@ -983,7 +1007,7 @@ where
                                     )
                                 })
                                 .flat_map(|location| {
-                                    lsp_location_to_location(location, offset_encoding)
+                                    lsp_location_to_location(location, offset_encoding, server_id)
                                 }),
                         );
                     }
@@ -1058,7 +1082,8 @@ pub fn goto_reference(cx: &mut Context) {
                     None,
                 )
                 .unwrap();
-            async move { anyhow::Ok((future.await?, offset_encoding)) }
+            let server_id = language_server.id();
+            async move { anyhow::Ok((future.await?, offset_encoding, server_id)) }
         })
         .collect();
 
@@ -1066,12 +1091,11 @@ pub fn goto_reference(cx: &mut Context) {
         let mut locations = Vec::new();
         while let Some(response) = futures.next().await {
             match response {
-                Ok((lsp_locations, offset_encoding)) => locations.extend(
-                    lsp_locations
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|location| lsp_location_to_location(location, offset_encoding)),
-                ),
+                Ok((lsp_locations, offset_encoding, server_id)) => {
+                    locations.extend(lsp_locations.into_iter().flatten().flat_map(|location| {
+                        lsp_location_to_location(location, offset_encoding, server_id)
+                    }))
+                }
                 Err(err) => log::error!("Error requesting references: {err}"),
             }
         }

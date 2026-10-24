@@ -55,6 +55,7 @@ pub struct ApplyEditError {
 pub enum ApplyEditErrorKind {
     DocumentChanged,
     FileNotFound,
+    ReadOnlySource,
     InvalidUrl(helix_core::uri::UrlConversionError),
     IoError(std::io::Error),
     // TODO: check edits before applying and propagate failure
@@ -78,6 +79,9 @@ impl Display for ApplyEditErrorKind {
         match self {
             ApplyEditErrorKind::DocumentChanged => f.write_str("document has changed"),
             ApplyEditErrorKind::FileNotFound => f.write_str("file not found"),
+            ApplyEditErrorKind::ReadOnlySource => {
+                f.write_str("language server sources are read-only")
+            }
             ApplyEditErrorKind::InvalidUrl(err) => f.write_str(&format!("{err}")),
             ApplyEditErrorKind::IoError(err) => f.write_str(&format!("{err}")),
         }
@@ -99,7 +103,7 @@ impl Editor {
                 return Err(err.into());
             }
         };
-        let path = uri.as_path().expect("URIs are valid paths");
+        let path = uri.as_path().ok_or(ApplyEditErrorKind::ReadOnlySource)?;
 
         let doc_id = match self.open(path, Action::Load) {
             Ok(doc_id) => doc_id,
@@ -235,12 +239,10 @@ impl Editor {
         op: &lsp::ResourceOp,
     ) -> Result<(), ApplyEditErrorKind> {
         use lsp::ResourceOp;
-        // NOTE: If `Uri` gets another variant than `Path`, the below `expect`s
-        // may no longer be valid.
         match op {
             ResourceOp::Create(op) => {
                 let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
+                let path = uri.as_path().ok_or(ApplyEditErrorKind::ReadOnlySource)?;
                 let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
                     !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
                 });
@@ -250,7 +252,7 @@ impl Editor {
             }
             ResourceOp::Delete(op) => {
                 let uri = Uri::try_from(&op.uri)?;
-                let path = uri.as_path().expect("URIs are valid paths");
+                let path = uri.as_path().ok_or(ApplyEditErrorKind::ReadOnlySource)?;
                 let ignore_if_not_exists = op
                     .options
                     .as_ref()
@@ -267,9 +269,11 @@ impl Editor {
             }
             ResourceOp::Rename(op) => {
                 let from_uri = Uri::try_from(&op.old_uri)?;
-                let from = from_uri.as_path().expect("URIs are valid paths");
+                let from = from_uri
+                    .as_path()
+                    .ok_or(ApplyEditErrorKind::ReadOnlySource)?;
                 let to_uri = Uri::try_from(&op.new_uri)?;
-                let to = to_uri.as_path().expect("URIs are valid paths");
+                let to = to_uri.as_path().ok_or(ApplyEditErrorKind::ReadOnlySource)?;
                 let ignore_if_exists = op.options.as_ref().is_some_and(|options| {
                     !options.overwrite.unwrap_or(false) && options.ignore_if_exists.unwrap_or(false)
                 });
@@ -288,10 +292,13 @@ impl Editor {
         version: Option<i32>,
         mut diagnostics: Vec<lsp::Diagnostic>,
     ) {
-        let doc = self
-            .documents
-            .values_mut()
-            .find(|doc| doc.uri().is_some_and(|u| u == uri));
+        let doc = self.documents.values_mut().find(|doc| {
+            doc.uri().is_some_and(|u| u == uri)
+                && (!doc.is_virtual()
+                    || provider
+                        .language_server_id()
+                        .is_some_and(|id| doc.supports_language_server(id)))
+        });
 
         if let Some((version, doc)) = version.zip(doc.as_ref()) {
             if version != doc.version() {

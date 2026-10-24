@@ -384,6 +384,7 @@ fn write_impl(
 ) -> anyhow::Result<()> {
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
+    ensure!(!doc.is_virtual(), "Language server sources are read-only");
     let doc_id = doc.id();
     let view_id = view.id;
 

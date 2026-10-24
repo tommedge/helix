@@ -1,9 +1,8 @@
 use arc_swap::{access::Map, ArcSwap};
 use futures_util::Stream;
-use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range, Selection};
+use helix_core::{diagnostic::Severity, pos_at_coords, syntax, Range};
 use helix_lsp::{
     lsp::{self, notification::Notification},
-    util::lsp_range_to_range,
     LanguageServerId, LspProgressMap,
 };
 use helix_stdx::path::get_relative_path;
@@ -1123,11 +1122,10 @@ impl Application {
                         Ok(serde_json::Value::Null)
                     }
                     Ok(MethodCall::ShowDocument(params)) => {
-                        let language_server = language_server!();
-                        let offset_encoding = language_server.offset_encoding();
-
-                        let result = self.handle_show_document(params, offset_encoding);
-                        Ok(json!(result))
+                        self.handle_show_document(params, server_id, id);
+                        // Reply after source loading has succeeded or failed, without
+                        // blocking the event loop on a request to this same server.
+                        return;
                     }
                     Ok(MethodCall::WorkspaceDiagnosticRefresh) => {
                         let server_id = language_server!().id();
@@ -1201,8 +1199,13 @@ impl Application {
     fn handle_show_document(
         &mut self,
         params: lsp::ShowDocumentParams,
-        offset_encoding: helix_lsp::OffsetEncoding,
-    ) -> lsp::ShowDocumentResult {
+        server_id: helix_lsp::LanguageServerId,
+        request_id: helix_lsp::jsonrpc::Id,
+    ) {
+        let Some(server) = self.editor.language_servers.get_by_id(server_id).cloned() else {
+            return;
+        };
+        let offset_encoding = server.offset_encoding();
         if let lsp::ShowDocumentParams {
             external: Some(true),
             uri,
@@ -1210,7 +1213,8 @@ impl Application {
         } = params
         {
             self.jobs.callback(crate::open_external_url_callback(uri));
-            return lsp::ShowDocumentResult { success: true };
+            let _ = server.reply(request_id, Ok(json!({"success": true})));
+            return;
         };
 
         let lsp::ShowDocumentParams {
@@ -1224,11 +1228,10 @@ impl Application {
             Ok(uri) => uri,
             Err(err) => {
                 log::error!("{err}");
-                return lsp::ShowDocumentResult { success: false };
+                let _ = server.reply(request_id, Ok(json!({"success": false})));
+                return;
             }
         };
-        // If `Uri` gets another variant other than `Path` this may not be valid.
-        let path = uri.as_path().expect("URIs are valid paths");
 
         // Determine the focus strategy based on the current UI state and LSP request:
         // 1. If there is no pop-up overlay, jump directly (Replace).
@@ -1243,31 +1246,35 @@ impl Application {
             }
         };
 
-        let doc_id = match self.editor.open(path, action) {
-            Ok(id) => id,
-            Err(err) => {
-                log::error!("failed to open path: {:?}: {:?}", uri, err);
-                return lsp::ShowDocumentResult { success: false };
-            }
-        };
-
-        let doc = doc_mut!(self.editor, &doc_id);
-        if let Some(range) = selection {
-            // TODO: convert inside server
-            if let Some(new_range) = lsp_range_to_range(doc.text(), range, offset_encoding) {
-                let view = view_mut!(self.editor);
-
-                // we flip the range so that the cursor sits on the start of the symbol
-                // (for example start of the function).
-                doc.set_selection(view.id, Selection::single(new_range.head, new_range.anchor));
-                if action.align_view(view, doc.id()) {
-                    align_view(doc, view, Align::Center);
+        let content = self.editor.virtual_document_content(&uri, server_id);
+        self.jobs.callback(async move {
+            let content = content.await;
+            Ok(crate::job::Callback::Editor(Box::new(move |editor| {
+                let result = content
+                    .and_then(|content| editor.open_lsp_document(&uri, server_id, content, action));
+                let success = match result {
+                    Ok(doc_id) => {
+                        if let Some(range) = selection {
+                            crate::commands::lsp::select_lsp_range(
+                                editor,
+                                doc_id,
+                                range,
+                                offset_encoding,
+                                action,
+                            );
+                        }
+                        true
+                    }
+                    Err(err) => {
+                        editor.set_error(format!("Failed to open {uri}: {err}"));
+                        false
+                    }
+                };
+                if let Err(err) = server.reply(request_id, Ok(json!({"success": success}))) {
+                    log::error!("Failed to reply to showDocument: {err}");
                 }
-            } else {
-                log::warn!("lsp position out of bounds - {:?}", range);
-            };
-        };
-        lsp::ShowDocumentResult { success: true }
+            })))
+        });
     }
 
     fn restore_term(&mut self) -> std::io::Result<()> {

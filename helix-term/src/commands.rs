@@ -3314,6 +3314,7 @@ fn buffer_picker(cx: &mut Context) {
     struct BufferMeta<'a> {
         id: DocumentId,
         path: Option<Cow<'a, Path>>,
+        virtual_name: Option<String>,
         is_modified: bool,
         is_current: bool,
         focused_at: std::time::Instant,
@@ -3321,6 +3322,7 @@ fn buffer_picker(cx: &mut Context) {
 
     let new_meta = |doc: &Document| BufferMeta {
         id: doc.id(),
+        virtual_name: doc.is_virtual().then(|| doc.display_name().into_owned()),
         path: doc
             .path()
             .map(ToOwned::to_owned)
@@ -3352,9 +3354,13 @@ fn buffer_picker(cx: &mut Context) {
             }
             flags.into()
         }),
-        PickerColumn::new("path", |meta: &BufferMeta, config: &PathStyleConfig| {
-            config.stylize(meta.path.as_deref(), None)
-        }),
+        PickerColumn::new(
+            "path",
+            |meta: &BufferMeta, config: &PathStyleConfig| match &meta.virtual_name {
+                Some(name) => name.as_str().into(),
+                None => config.stylize(meta.path.as_deref(), None),
+            },
+        ),
     ];
 
     let initial_cursor = if cx
@@ -3395,6 +3401,7 @@ fn jumplist_picker(cx: &mut Context) {
     struct JumpMeta<'a> {
         id: DocumentId,
         path: Option<Cow<'a, Path>>,
+        virtual_name: Option<String>,
         selection: Selection,
         line_start: usize,
         text: String,
@@ -3420,6 +3427,7 @@ fn jumplist_picker(cx: &mut Context) {
 
         JumpMeta {
             id: doc_id,
+            virtual_name: doc.is_virtual().then(|| doc.display_name().into_owned()),
             path: doc
                 .path()
                 .map(ToOwned::to_owned)
@@ -3433,9 +3441,13 @@ fn jumplist_picker(cx: &mut Context) {
 
     let columns = [
         ui::PickerColumn::new("id", |item: &JumpMeta, _| item.id.to_string().into()),
-        ui::PickerColumn::new("path", |item: &JumpMeta, config: &PathStyleConfig| {
-            config.stylize(item.path.as_deref(), Some(item.line_start))
-        }),
+        ui::PickerColumn::new(
+            "path",
+            |item: &JumpMeta, config: &PathStyleConfig| match &item.virtual_name {
+                Some(name) => format!("{name}:{}", item.line_start + 1).into(),
+                None => config.stylize(item.path.as_deref(), Some(item.line_start)),
+            },
+        ),
         ui::PickerColumn::new("flags", |item: &JumpMeta, _| {
             let mut flags = Vec::new();
             if item.is_current {

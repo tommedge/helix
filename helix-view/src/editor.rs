@@ -1821,6 +1821,11 @@ impl Editor {
         let Some(doc) = self.documents.get_mut(&doc_id) else {
             return;
         };
+        // Archive sources must keep the server that supplied their contents. In
+        // particular, never launch a server using the editor's current directory.
+        if doc.is_virtual() {
+            return;
+        }
         let Some(doc_url) = doc.url() else {
             return;
         };
@@ -1953,8 +1958,8 @@ impl Editor {
                 // Boolean value is determined before the call to `view_mut` because the operation requires a borrow
                 // of `self.tree`, which is mutably borrowed when `view_mut` is called.
                 let remove_empty_scratch = !doc.is_modified()
-                    // If the buffer has no path and is not modified, it is an empty scratch buffer.
-                    && doc.path().is_none()
+                    // Virtual sources have no path, but are not scratch buffers.
+                    && doc.uri().is_none()
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
@@ -2096,6 +2101,101 @@ impl Editor {
 
     pub fn document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
         self.document_by_path(path).map(|doc| doc.id)
+    }
+
+    fn virtual_document_id(&self, uri: &Uri, server_id: LanguageServerId) -> Option<DocumentId> {
+        self.documents().find_map(|doc| {
+            (doc.is_virtual()
+                && doc.uri().as_ref() == Some(uri)
+                && doc.supports_language_server(server_id))
+            .then_some(doc.id())
+        })
+    }
+
+    /// Fetch archive source without blocking the editor or opening an empty buffer
+    /// on failure. Existing sources are cached by both URI and originating server.
+    pub fn virtual_document_content(
+        &self,
+        uri: &Uri,
+        server_id: LanguageServerId,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'static {
+        let needs_content =
+            uri.as_path().is_none() && self.virtual_document_id(uri, server_id).is_none();
+        let request = needs_content.then(|| {
+            self.language_server_by_id(server_id)
+                .and_then(|server| {
+                    server.command(lsp::Command {
+                        title: "Load archive source".into(),
+                        command: "decompile".into(),
+                        arguments: Some(vec![serde_json::json!(uri.to_url().unwrap())]),
+                    })
+                })
+                .ok_or_else(|| anyhow!("Source server is unavailable or cannot decompile sources"))
+        });
+        async move {
+            let Some(request) = request else {
+                return Ok(None);
+            };
+            let response = request?.await?;
+            let code = response
+                .as_ref()
+                .and_then(|value| value.get("code"))
+                .and_then(|code| code.as_str())
+                .filter(|code| !code.trim().is_empty())
+                .ok_or_else(|| anyhow!("Language server returned no archive source"))?;
+            Ok(Some(code.to_owned()))
+        }
+    }
+
+    /// Open an LSP location after `virtual_document_content` completes. Archive
+    /// sources have no filesystem path and are never registered with other servers.
+    pub fn open_lsp_document(
+        &mut self,
+        uri: &Uri,
+        server_id: LanguageServerId,
+        content: Option<String>,
+        action: Action,
+    ) -> anyhow::Result<DocumentId> {
+        if let Some(path) = uri.as_path() {
+            return Ok(self.open(path, action)?);
+        }
+        if let Some(id) = self.virtual_document_id(uri, server_id) {
+            self.switch(id, action);
+            return Ok(id);
+        }
+        let server = self
+            .language_servers
+            .get_by_id(server_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Source server is no longer available"))?;
+        let content = content.ok_or_else(|| anyhow!("Archive source is no longer loaded"))?;
+        let mut doc = Document::from(
+            content.into(),
+            None,
+            self.config.clone(),
+            self.syn_loader.clone(),
+        );
+        doc.virtual_uri = Some(uri.clone());
+        doc.readonly = true;
+        let url = uri.to_url().unwrap();
+        let language = if matches!(
+            Path::new(url.path()).extension().and_then(|s| s.to_str()),
+            Some("kt" | "kts")
+        ) {
+            "kotlin"
+        } else {
+            "java"
+        };
+        doc.set_language_by_language_id(language, &self.syn_loader.load())?;
+        server.text_document_did_open(url, doc.version(), doc.text(), language.into());
+        doc.language_servers.insert(server.name().into(), server);
+        let id = self.new_document(doc);
+        self.switch(id, action);
+        helix_event::dispatch(DocumentDidOpen {
+            editor: self,
+            doc: id,
+        });
+        Ok(id)
     }
 
     // ??? possible use for integration tests
@@ -2385,12 +2485,18 @@ impl Editor {
     ) -> impl Iterator<Item = helix_core::Diagnostic> + 'a {
         let text = document.text().clone();
         let language_config = document.language.clone();
+        let source_server = document
+            .is_virtual()
+            .then(|| document.language_servers().next().map(|server| server.id()));
         document
             .uri()
             .and_then(|uri| diagnostics.get(&uri))
             .map(|diags| {
                 diags.iter().filter_map(move |(diagnostic, provider)| {
                     let server_id = provider.language_server_id()?;
+                    if source_server.is_some_and(|owner| owner != Some(server_id)) {
+                        return None;
+                    }
                     let ls = language_servers.get_by_id(server_id)?;
                     language_config
                         .as_ref()

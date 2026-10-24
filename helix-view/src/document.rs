@@ -160,6 +160,7 @@ pub struct Document {
     pub inlay_hints_oudated: bool,
 
     path: Option<PathBuf>,
+    pub(crate) virtual_uri: Option<helix_core::Uri>,
     relative_path: OnceLock<Option<PathBuf>>,
     /// Lazily-computed workspace root for this document (the ancestor that contains a `.git` /
     /// `.svn` / `.jj` / `.helix`). Avoids per-call `find_workspace_in` ancestor walks for hot
@@ -734,6 +735,7 @@ impl Document {
             id: DocumentId::default(),
             active_snippet: None,
             path: None,
+            virtual_uri: None,
             relative_path: OnceLock::new(),
             workspace_root: OnceLock::new(),
             encoding,
@@ -1003,6 +1005,7 @@ impl Document {
         impl Future<Output = Result<DocumentSavedEvent, anyhow::Error>> + 'static + Send,
         anyhow::Error,
     > {
+        anyhow::ensure!(!self.is_virtual(), "Language server sources are read-only");
         log::debug!(
             "submitting save of doc '{:?}'",
             self.path().map(|path| path.to_string_lossy())
@@ -1213,6 +1216,10 @@ impl Document {
         &self,
         loader: &syntax::Loader,
     ) -> Option<Arc<syntax::config::LanguageConfiguration>> {
+        if self.is_virtual() {
+            let language = loader.language_for_name(self.language_id()?)?;
+            return Some(loader.language(language).config().clone());
+        }
         let language = loader
             .language_for_filename(self.path.as_ref()?)
             .or_else(|| loader.language_for_shebang(self.text().slice(..)))?;
@@ -1272,10 +1279,11 @@ impl Document {
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
         // Allows setting the flag for files the user cannot modify, like root files
-        self.readonly = match &self.path {
-            None => false,
-            Some(p) => readonly(p),
-        };
+        self.readonly = self.is_virtual()
+            || match &self.path {
+                None => false,
+                Some(p) => readonly(p),
+            };
     }
 
     /// Reload the document from its path.
@@ -1339,6 +1347,9 @@ impl Document {
     /// observers (like LSP), in most cases `Editor::set_doc_path`
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
+        if self.is_virtual() {
+            return;
+        }
         let path = path.map(helix_stdx::path::canonicalize);
 
         // `take` to remove any prior relative path that may have existed.
@@ -1648,6 +1659,9 @@ impl Document {
         view_id: ViewId,
         emit_lsp_notification: bool,
     ) -> bool {
+        if self.is_virtual() && !transaction.changes().is_empty() {
+            return false;
+        }
         // store the state just before any changes are made. This allows us to undo to the
         // state just before a transaction was applied.
         if self.changes.is_empty() && !transaction.changes().is_empty() {
@@ -2060,13 +2074,19 @@ impl Document {
         self.path.as_deref()
     }
 
-    /// File path as a URL.
+    /// Original document URL, including language-server-owned archive sources.
     pub fn url(&self) -> Option<Url> {
-        Url::from_file_path(self.path()?).ok()
+        self.uri()?.to_url().ok()
     }
 
     pub fn uri(&self) -> Option<helix_core::Uri> {
-        Some(self.path()?.into())
+        self.virtual_uri
+            .clone()
+            .or_else(|| self.path().map(Into::into))
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        self.virtual_uri.is_some()
     }
 
     #[inline]
@@ -2131,6 +2151,9 @@ impl Document {
     }
 
     pub fn display_name(&self) -> Cow<'_, str> {
+        if let Some(uri) = &self.virtual_uri {
+            return uri.to_string().into();
+        }
         self.relative_path()
             .map_or_else(|| SCRATCH_BUFFER_NAME.into(), |path| path.to_string_lossy())
     }
